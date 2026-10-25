@@ -176,7 +176,7 @@ const TOOLS = [
   {
     id: "meal", tab: "Meal Planner", title: "Eat well, spend wisely.",
     blurb: "Add meal options with their price and nutrition. Tipid builds a day’s plan that makes the most of your food budget.",
-    capLabel: "Daily food budget (₱)", cap: 150, goal: "protein", method: "knapsack", db: true, unit: "serving", whole: "servings", splitNote: "you can't always buy part of a meal",
+    capLabel: "Daily food budget (₱)", capLabels: { daily: "Daily food budget (₱)", weekly: "Weekly food budget (₱)" }, cap: 150, periods: true, period: "daily", maxPer: 3, goal: "protein", method: "knapsack", db: true, unit: "serving", whole: "servings", splitNote: "you can't always buy part of a meal",
     methods: [
       ["knapsack", "0/1 Knapsack", "Each food is taken whole or skipped. Best for real meals you can't split."],
       ["fractional", "Fractional Knapsack", "Foods can be split into partial servings, which gives the highest possible total."]
@@ -201,10 +201,13 @@ function renderResult(t) {
   const items = t.rows.filter((r) => r.name.trim())
     .map((r) => ({ ...r, cost: Math.max(0, Math.floor(+r.cost || 0)), value: t.val(r) }));
   const cap = Math.max(0, Math.floor(+t.cap || 0));
-  const must = items.filter((r) => r.must).map((r) => ({ ...r, frac: 1 }));
+  const weekly = !!t.periods && t.period === "weekly";
+  const mustMult = weekly ? 7 : 1;                       // must-have foods are eaten every day of the week
+  const maxPer = weekly ? Math.max(1, Math.floor(+t.maxPer || 1)) : 1; // other foods repeat up to this many times
+  const W = (a, k) => a.reduce((s, x) => s + (+x[k] || 0) * x.frac, 0); // weighted by servings taken
+  const must = items.filter((r) => r.must).map((r) => ({ ...r, frac: mustMult }));
   const pool = items.filter((r) => !r.must);
-  const left = cap - sum(must, "cost");
-  const W = (a, k) => a.reduce((s, x) => s + (+x[k] || 0) * x.frac, 0); // weighted by portion taken
+  const left = cap - W(must, "cost");
   const n1 = (n) => (Math.round(n * 10) / 10).toLocaleString();
 
   if (!items.length) {
@@ -212,37 +215,47 @@ function renderResult(t) {
     return;
   }
   if (left < 0) {
-    box.innerHTML = `<div class="empty-state"><p class="warn">Your must-haves cost ${peso(sum(must, "cost"))}, which exceeds your ${peso(cap)} budget.</p><p class="muted">Raise the budget or uncheck a must-have.</p></div>`;
+    box.innerHTML = `<div class="empty-state"><p class="warn">Your must-haves cost ${peso(W(must, "cost"))}, which exceeds your ${peso(cap)} budget.</p><p class="muted">Raise the budget or uncheck a must-have.</p></div>`;
     return;
   }
 
   const isFrac = t.method === "fractional";
+  // Weekly plans may repeat a food, so each food becomes up to maxPer identical copies.
+  const copies = pool.flatMap((r, src) => Array.from({ length: maxPer }, () => ({ ...r, src })));
+  const gather = (list) => {
+    const m = new Map();
+    list.forEach(({ src, f }) => m.set(src, (m.get(src) || 0) + f));
+    return [...m].map(([src, f]) => ({ ...pool[src], src, frac: f }));
+  };
+  const combos = copies.length > 52 ? "an astronomical number of" : (2 ** copies.length).toLocaleString();
   let chosen, skipped, altTotal, cmpTitle, altLabel, note;
   const mustVal = W(must, "value");
   if (isFrac) {
-    const parts = fractional(pool, left);
-    const taken = new Set(parts.map((p) => p.i));
-    chosen = [...must, ...parts.map((p) => ({ ...pool[p.i], frac: p.frac }))];
+    const picked = gather(fractional(copies, left).map((p) => ({ src: copies[p.i].src, f: p.frac })));
+    const taken = new Set(picked.map((x) => x.src));
+    chosen = [...must, ...picked];
     skipped = pool.filter((_, i) => !taken.has(i));
-    altTotal = mustVal + knapsack(pool, left).value;
+    altTotal = mustVal + knapsack(copies, left).value;
     cmpTitle = `Compare with whole ${t.whole} (0/1 knapsack)`;
     altLabel = `0/1 Knapsack, whole ${t.whole} only`;
-    note = `The fractional method sorted ${pool.length} items by value per peso and filled the budget, so it needed no table at all.`;
+    note = `The fractional method sorted ${copies.length} servings by value per peso and filled the budget, so it needed no table at all.`;
   } else {
-    const dp = knapsack(pool, left);
-    chosen = [...must, ...dp.picked.map((i) => ({ ...pool[i], frac: 1 }))];
-    skipped = pool.filter((_, i) => !dp.picked.includes(i));
-    altTotal = mustVal + greedy(pool, left).value;
+    const dp = knapsack(copies, left);
+    const picked = gather(dp.picked.map((i) => ({ src: copies[i].src, f: 1 })));
+    const taken = new Set(picked.map((x) => x.src));
+    chosen = [...must, ...picked];
+    skipped = pool.filter((_, i) => !taken.has(i));
+    altTotal = mustVal + greedy(copies, left).value;
     cmpTitle = "Compare with the greedy method";
     altLabel = "Greedy by value per peso";
-    note = `The calculation used ${(pool.length * (left + 1)).toLocaleString()} table cells instead of checking all ${(2 ** pool.length).toLocaleString()} combinations.`;
+    note = `The calculation used ${(copies.length * (left + 1)).toLocaleString()} table cells instead of checking all ${combos} combinations.`;
   }
   const spent = W(chosen, "cost");
   const total = W(chosen, "value");
   const diff = isFrac ? total - altTotal : total - altTotal;
   const used = cap ? Math.round((spent / cap) * 100) : 0;
   const segs = chosen.map((r, i) => `<span title="${esc(r.name)}: ${peso(r.cost * r.frac)}" style="flex:${Math.max(r.cost * r.frac, 0.0001)};background:${COLORS[i % COLORS.length]}">${esc(r.name)}</span>`).join("");
-  const tag = (r) => r.must ? "<i>Must</i>" : r.frac < 1 ? `<i class="part">${Math.round(r.frac * 100)}% ${t.unit}</i>` : "";
+  const tag = (r) => weekly ? `${r.must ? "<i>Must</i>" : ""}<i class="part">${n1(r.frac)}× / week</i>` : r.must ? "<i>Must</i>" : r.frac < 1 ? `<i class="part">${Math.round(r.frac * 100)}% ${t.unit}</i>` : "";
   const cmpText = isFrac
     ? (diff > 0.05 ? `Splitting gives ${n1(diff)} more ${t.goalLabel()} than whole ${t.whole} only. Fractional is the upper limit for this budget, but ${t.splitNote}.` : "Both methods tied here, because whole ${t.whole} already fit the budget.")
     : (diff > 0 ? `Tipid found ${n1(diff)} more ${t.goalLabel()} than the greedy shortcut.` : "Both methods tied here. Change the numbers to find a case where greedy falls short.");
@@ -250,8 +263,9 @@ function renderResult(t) {
   box.innerHTML = `
     <div class="spent"><span class="big">${peso(spent)}</span><span class="of">of ${peso(cap)} allocated</span></div>
     <div class="strip" role="img" aria-label="${used}% of budget allocated">${segs}<span class="rest" style="flex:${Math.max(cap - spent, 0.0001)}"></span></div>
-    <p class="allocation-caption">${used}% allocated · ${peso(cap - spent)} left unspent${t.methods ? ` · ${isFrac ? "Fractional" : "0/1"} method` : ""}</p>
+    <p class="allocation-caption">${used}% allocated · ${peso(cap - spent)} left unspent${t.methods ? ` · ${isFrac ? "Fractional" : "0/1"} method` : ""}${weekly ? " · weekly plan" : ""}</p>
     <div class="metrics">${t.metrics.map(([l, k, u]) => `<div><b>${Math.round(W(chosen, k)).toLocaleString()}</b><small>${l} (${u})</small></div>`).join("")}</div>
+    ${weekly ? `<p class="allocation-caption avg">≈ ${t.metrics.map(([l, k, u]) => `${Math.round(W(chosen, k) / 7).toLocaleString()} ${u}${u === "kcal" || u === "points" ? "" : " " + l.toLowerCase()}`).join(" · ")} per day on average</p>` : ""}
     <h3>Selected for your plan</h3>
     <ul class="picked">${chosen.map((r, i) => `<li><span class="pl"><span class="sw" style="background:${COLORS[i % COLORS.length]}"></span>${esc(r.name)}${tag(r)}</span><b>${peso(r.cost * r.frac)}</b></li>`).join("") || '<li class="muted">Nothing fits yet. Try a bigger budget.</li>'}</ul>
     ${skipped.length ? `<h3>Not included</h3><p class="muted left-out">${skipped.map((r) => esc(r.name)).join(", ")}</p>` : ""}
@@ -328,7 +342,11 @@ function settingsHTML(t) {
   if (!t.methods) return "";
   return `<dialog class="modal settings-modal" aria-labelledby="${t.id}-st"><div class="modal-body">
     <h2 id="${t.id}-st">Settings</h2><p class="sub">Choose how Tipid builds your plan.</p>
-    <fieldset class="method-group"><legend>Method</legend>${t.methods.map(([k, l, d]) => `<label class="opt"><input type="radio" name="${t.id}-method" value="${k}"${t.method === k ? " checked" : ""}><span><b>${l}</b><small>${d}</small></span></label>`).join("")}</fieldset>
+    ${t.periods ? `<fieldset class="method-group"><legend>Plan period</legend>
+      <label class="opt"><input type="radio" name="${t.id}-period" value="daily"${t.period === "daily" ? " checked" : ""}><span><b>Daily</b><small>Plan one day of meals.</small></span></label>
+      <label class="opt"><input type="radio" name="${t.id}-period" value="weekly"${t.period === "weekly" ? " checked" : ""}><span><b>Weekly</b><small>Plan 7 days. Must-have foods are eaten every day, and other foods can repeat up to the limit below.</small></span></label>
+      <label class="max-field"${t.period === "weekly" ? "" : " hidden"}>Max servings of each food per week<input type="number" class="max-per" min="1" max="7" inputmode="numeric" value="${t.maxPer}"></label>
+    </fieldset>` : ""}<fieldset class="method-group"><legend>Method</legend>${t.methods.map(([k, l, d]) => `<label class="opt"><input type="radio" name="${t.id}-method" value="${k}"${t.method === k ? " checked" : ""}><span><b>${l}</b><small>${d}</small></span></label>`).join("")}</fieldset>
     <div class="modal-actions"><button type="button" class="btn-save settings-done">Done</button></div>
   </div></dialog>`;
 }
@@ -344,7 +362,7 @@ function build(t, first) {
       <div class="card editor">
         <div class="editor-header"><h2>${t.editorTitle}</h2><span class="item-count"></span></div>
         <div class="top">
-          <label>${t.capLabel}<input class="cap" type="number" min="0" inputmode="decimal" value="${t.cap}"></label>
+          <label><span class="cap-text">${t.capLabel}</span><input class="cap" type="number" min="0" inputmode="decimal" value="${t.cap}"></label>
           ${t.goals ? `<label>Optimize for<select class="goal">${t.goals.map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</select></label>` : ""}
         </div>
         <ul class="items"></ul>
@@ -381,7 +399,7 @@ function build(t, first) {
     const el = e.target;
     if (el.classList.contains("cap")) t.cap = el.value;
     else if (el.classList.contains("goal")) t.goal = el.value;
-    else if (el.classList.contains("method")) t.method = el.value;
+    else if (el.classList.contains("max-per")) t.maxPer = Math.min(7, Math.max(1, Math.floor(+el.value) || 1));
     else if (el.classList.contains("food-search")) { showFoods(s, el.value); return; }
     else return;
     renderResult(t);
@@ -399,6 +417,16 @@ function build(t, first) {
     sdlg.addEventListener("click", (e) => { if (e.target === sdlg) sdlg.close(); });
     sdlg.addEventListener("change", (e) => {
       if (e.target.name === `${t.id}-method`) { t.method = e.target.value; renderResult(t); }
+      if (e.target.name === `${t.id}-period`) {
+        const wk = e.target.value === "weekly";
+        if (wk === (t.period === "weekly")) return;
+        t.period = e.target.value;
+        t.cap = wk ? Math.round((+t.cap || 0) * 7) : Math.round((+t.cap || 0) / 7); // keep the budget in step with the period
+        s.querySelector(".cap").value = t.cap;
+        s.querySelector(".cap-text").textContent = t.capLabels[t.period];
+        sdlg.querySelector(".max-field").hidden = !wk;
+        renderResult(t);
+      }
     });
   }
   s.addEventListener("click", (e) => {
